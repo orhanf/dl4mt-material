@@ -684,6 +684,9 @@ def build_sampler(tparams, options, trng):
     # get the weighted averages of context for this target word y
     ctxs = proj[1]
 
+    # get alignments (weights) to be returned by f_next function
+    alignments = proj[2]
+
     logit_lstm = get_layer('ff')[1](tparams, next_state, options,
                                     prefix='ff_logit_lstm', activ='linear')
     logit_prev = get_layer('ff')[1](tparams, emb, options,
@@ -704,7 +707,7 @@ def build_sampler(tparams, options, trng):
     # sampled word for the next target, next hidden state to be used
     print 'Building f_next..',
     inps = [y, ctx, init_state]
-    outs = [next_probs, next_sample, next_state]
+    outs = [next_probs, next_sample, next_state, alignments]
     f_next = theano.function(inps, outs, name='f_next', profile=profile)
     print 'Done'
 
@@ -714,7 +717,7 @@ def build_sampler(tparams, options, trng):
 # generate sample, either with stochastic sampling or beam search. Note that,
 # this function iteratively calls f_init and f_next functions.
 def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
-               stochastic=True, argmax=False):
+               stochastic=True, argmax=False, alignments=False):
 
     # k is the beam size we have
     if k > 1:
@@ -743,6 +746,9 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
         inps = [next_w, ctx, next_state]
         ret = f_next(*inps)
         next_p, next_w, next_state = ret[0], ret[1], ret[2]
+
+        if alignments:
+            alignment_weigths = ret[-1]
 
         if stochastic:
             if argmax:
@@ -876,7 +882,7 @@ def adam(lr, tparams, grads, inp, cost):
     return f_grad_shared, f_update
 
 
-def adadelta(lr, tparams, grads, inp, cost):
+def adadelta(lr, tparams, grads, inp, cost, opt_ret=None):
     zipped_grads = [theano.shared(p.get_value() * numpy.float32(0.),
                                   name='%s_grad' % k)
                     for k, p in tparams.iteritems()]
@@ -891,7 +897,13 @@ def adadelta(lr, tparams, grads, inp, cost):
     rg2up = [(rg2, 0.95 * rg2 + 0.05 * (g ** 2))
              for rg2, g in zip(running_grads2, grads)]
 
-    f_grad_shared = theano.function(inp, cost, updates=zgup+rg2up,
+    outs = [cost]
+
+    # we expect a dictionary here for opt_ret
+    if opt_ret is not None:
+        outs += opt_ret.values()
+
+    f_grad_shared = theano.function(inp, outs, updates=zgup+rg2up,
                                     profile=profile)
 
     updir = [-tensor.sqrt(ru2 + 1e-6) / tensor.sqrt(rg2 + 1e-6) * zg
@@ -986,7 +998,8 @@ def train(dim_word=100,  # word vector dimensionality
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.en.tok.pkl',
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.fr.tok.pkl'],
           use_dropout=False,
-          reload_=False):
+          reload_=False,
+          disp_alignments=False):
 
     # Model options
     model_options = locals().copy()
@@ -1084,7 +1097,8 @@ def train(dim_word=100,  # word vector dimensionality
     # compile the optimizer, the actual computational graph is compiled here
     lr = tensor.scalar(name='lr')
     print 'Building optimizers...',
-    f_grad_shared, f_update = eval(optimizer)(lr, tparams, grads, inps, cost)
+    f_grad_shared, f_update = eval(optimizer)(lr, tparams, grads, inps, cost,
+                                              opt_ret)
     print 'Done'
 
     print 'Optimization'
@@ -1113,7 +1127,7 @@ def train(dim_word=100,  # word vector dimensionality
             uidx += 1
             use_noise.set_value(1.)
 
-            x, x_mask, y, y_mask = prepare_data(x, y, maxlen=maxlen,
+            x, x_mask, y, y_mask = prepare_data(x, y, maxlen=None,
                                                 n_words_src=n_words_src,
                                                 n_words=n_words)
 
@@ -1125,7 +1139,8 @@ def train(dim_word=100,  # word vector dimensionality
             ud_start = time.time()
 
             # compute cost, grads and copy grads to shared variables
-            cost = f_grad_shared(x, x_mask, y, y_mask)
+            ret_vals = f_grad_shared(x, x_mask, y, y_mask)
+            cost = ret_vals[0]
 
             # do the update on parameters
             f_update(lrate)
@@ -1140,7 +1155,10 @@ def train(dim_word=100,  # word vector dimensionality
 
             # verbose
             if numpy.mod(uidx, dispFreq) == 0:
-                print 'Epoch ', eidx, 'Update ', uidx, 'Cost ', cost, 'UD ', ud
+                print 'Epoch ', eidx, 'Update ', uidx, \
+                    'Cost ', cost, 'UD ', ud, \
+                    'Max-alpha {}'.format(ret_vals[-1].max()) \
+                    if disp_alignments else ''
 
             # save the best model so far
             if numpy.mod(uidx, saveFreq) == 0:
@@ -1164,7 +1182,8 @@ def train(dim_word=100,  # word vector dimensionality
                                                model_options, trng=trng, k=1,
                                                maxlen=30,
                                                stochastic=stochastic,
-                                               argmax=False)
+                                               argmax=False,
+                                               alignments=disp_alignments)
                     print 'Source ', jj, ': ',
                     for vv in x[:, jj]:
                         if vv == 0:
