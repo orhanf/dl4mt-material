@@ -322,15 +322,41 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
 
 # Conditional GRU layer with Attention
 def param_init_gru_cond(options, params, prefix='gru_cond',
-                        nin=None, dim=None, dimctx=None):
+                        nin=None, dim=None, dimctx=None,
+                        nin_nonlin=None, dim_nonlin=None):
     if nin is None:
         nin = options['dim']
     if dim is None:
         dim = options['dim']
     if dimctx is None:
         dimctx = options['dim']
+    if nin_nonlin is None:
+        nin_nonlin = nin
+    if dim_nonlin is None:
+        dim_nonlin = dim
 
-    params = param_init_gru(options, params, prefix, nin=nin, dim=dim)
+    W = numpy.concatenate([norm_weight(nin, dim),
+                           norm_weight(nin, dim)], axis=1)
+    params[_p(prefix, 'W')] = W
+    params[_p(prefix, 'b')] = numpy.zeros((2 * dim,)).astype('float32')
+    U = numpy.concatenate([ortho_weight(dim_nonlin),
+                           ortho_weight(dim_nonlin)], axis=1)
+    params[_p(prefix, 'U')] = U
+
+    Wx = norm_weight(nin_nonlin, dim_nonlin)
+    params[_p(prefix, 'Wx')] = Wx
+    Ux = ortho_weight(dim_nonlin)
+    params[_p(prefix, 'Ux')] = Ux
+    params[_p(prefix, 'bx')] = numpy.zeros((dim_nonlin,)).astype('float32')
+
+    U_nl = numpy.concatenate([ortho_weight(dim_nonlin),
+                              ortho_weight(dim_nonlin)], axis=1)
+    params[_p(prefix, 'U_nl')] = U_nl
+    params[_p(prefix, 'b_nl')] = numpy.zeros((2 * dim_nonlin,)).astype('float32')
+
+    Ux_nl = ortho_weight(dim_nonlin)
+    params[_p(prefix, 'Ux_nl')] = Ux_nl
+    params[_p(prefix, 'bx_nl')] = numpy.zeros((dim_nonlin,)).astype('float32')
 
     # context to LSTM
     Wc = norm_weight(dimctx, dim*2)
@@ -339,17 +365,13 @@ def param_init_gru_cond(options, params, prefix='gru_cond',
     Wcx = norm_weight(dimctx, dim)
     params[_p(prefix, 'Wcx')] = Wcx
 
-    # attention: prev -> hidden
-    Wi_att = norm_weight(nin, dimctx)
-    params[_p(prefix, 'Wi_att')] = Wi_att
+    # attention: combined -> hidden
+    W_comb_att = norm_weight(dim, dimctx)
+    params[_p(prefix, 'W_comb_att')] = W_comb_att
 
     # attention: context -> hidden
     Wc_att = norm_weight(dimctx)
     params[_p(prefix, 'Wc_att')] = Wc_att
-
-    # attention: LSTM -> hidden
-    Wd_att = norm_weight(dim, dimctx)
-    params[_p(prefix, 'Wd_att')] = Wd_att
 
     # attention: hidden bias
     b_att = numpy.zeros((dimctx,)).astype('float32')
@@ -365,12 +387,12 @@ def param_init_gru_cond(options, params, prefix='gru_cond',
 
 
 def gru_cond_layer(tparams, state_below, options, prefix='gru',
-                   mask=None, context=None, one_step=False, init_state=None,
-                   context_mask=None, **kwargs):
+                   mask=None, context=None, one_step=False,
+                   init_memory=None, init_state=None,
+                   context_mask=None,
+                   **kwargs):
 
     assert context, 'Context must be provided'
-    assert context.ndim == 3, \
-        'Context must be 3-d: #annotation x #sample x dim'
 
     if one_step:
         assert init_state, 'previous state must be provided'
@@ -382,7 +404,7 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         n_samples = 1
 
     # mask
-    if mask is None:  # sampling or beamsearch
+    if mask is None:
         mask = tensor.alloc(1., state_below.shape[0], 1)
 
     dim = tparams[_p(prefix, 'Wcx')].shape[1]
@@ -392,7 +414,9 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         init_state = tensor.alloc(0., n_samples, dim)
 
     # projected context
-    pctx_ = tensor.dot(context, tparams[_p(prefix, 'Wc_att')]) + \
+    assert context.ndim == 3, \
+        'Context must be 3-d: #annotation x #sample x dim'
+    pctx_ = tensor.dot(context, tparams[_p(prefix, 'Wc_att')]) +\
         tparams[_p(prefix, 'b_att')]
 
     def _slice(_x, n, dim):
@@ -400,32 +424,36 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
             return _x[:, :, n*dim:(n+1)*dim]
         return _x[:, n*dim:(n+1)*dim]
 
-    # projected x into hidden state proposal
-    state_belowx = tensor.dot(state_below, tparams[_p(prefix, 'Wx')]) + \
+    # projected x
+    state_belowx = tensor.dot(state_below, tparams[_p(prefix, 'Wx')]) +\
         tparams[_p(prefix, 'bx')]
-    # projected x into gru gates
-    state_below_ = tensor.dot(state_below, tparams[_p(prefix, 'W')]) + \
+    state_below_ = tensor.dot(state_below, tparams[_p(prefix, 'W')]) +\
         tparams[_p(prefix, 'b')]
-    # projected x into attention module
-    state_belowc = tensor.dot(state_below, tparams[_p(prefix, 'Wi_att')])
 
-    # step function to be used by scan
-    # arguments    | sequences      |  outputs-info   | non-seqs ...
-    def _step_slice(m_, x_, xx_, xc_, h_, ctx_, alpha_, pctx_, cc_,
-                    U, Wc, Wd_att, U_att, c_tt, Ux, Wcx):
+    def _step_slice(m_, x_, xx_, h_, ctx_, alpha_, pctx_, cc_,
+                    U, Wc, W_comb_att, U_att, c_tt, Ux, Wcx,
+                    U_nl, Ux_nl, b_nl, bx_nl):
+        preact1 = tensor.dot(h_, U)
+        preact1 += x_
+        preact1 = tensor.nnet.sigmoid(preact1)
+
+        r1 = _slice(preact1, 0, dim)
+        u1 = _slice(preact1, 1, dim)
+
+        preactx1 = tensor.dot(h_, Ux)
+        preactx1 *= r1
+        preactx1 += xx_
+
+        h1 = tensor.tanh(preactx1)
+
+        h1 = u1 * h_ + (1. - u1) * h1
+        h1 = m_[:, None] * h1 + (1. - m_)[:, None] * h_
 
         # attention
-        # project previous hidden state
-        pstate_ = tensor.dot(h_, Wd_att)
-
-        # add projected context
+        pstate_ = tensor.dot(h1, W_comb_att)
         pctx__ = pctx_ + pstate_[None, :, :]
-
-        # add projected previous output
-        pctx__ += xc_
+        #pctx__ += xc_
         pctx__ = tensor.tanh(pctx__)
-
-        # compute alignment weights
         alpha = tensor.dot(pctx__, U_att)+c_tt
         alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]])
         alpha = tensor.exp(alpha - alpha.max(0, keepdims=True))
@@ -433,59 +461,58 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         if context_mask:
             alpha = alpha * context_mask
         alpha = alpha / alpha.sum(0, keepdims=True)
+        ctx_ = (cc_ * alpha[:, :, None]).sum(0)  # current context
 
-        # conpute the weighted averages - current context to gru
-        ctx_ = (cc_ * alpha[:, :, None]).sum(0)
+        preact2 = tensor.dot(h1, U_nl)+b_nl
+        preact2 += tensor.dot(ctx_, Wc)
+        preact2 = tensor.nnet.sigmoid(preact2)
 
-        # conditional gru layer computations
-        preact = tensor.dot(h_, U)
-        preact += x_
-        preact += tensor.dot(ctx_, Wc)
-        preact = tensor.nnet.sigmoid(preact)
+        r2 = _slice(preact2, 0, dim)
+        u2 = _slice(preact2, 1, dim)
 
-        # reset and update gates
-        r = _slice(preact, 0, dim)
-        u = _slice(preact, 1, dim)
+        preactx2 = tensor.dot(h1, Ux_nl)+bx_nl
+        preactx2 *= r2
+        preactx2 += tensor.dot(ctx_, Wcx)
 
-        preactx = tensor.dot(h_, Ux)
-        preactx *= r
-        preactx += xx_
-        preactx += tensor.dot(ctx_, Wcx)
+        h2 = tensor.tanh(preactx2)
 
-        # hidden state proposal, leaky integrate and obtain next hidden state
-        h = tensor.tanh(preactx)
-        h = u * h_ + (1. - u) * h
-        h = m_[:, None] * h + (1. - m_)[:, None] * h_
+        h2 = u2 * h1 + (1. - u2) * h2
+        h2 = m_[:, None] * h2 + (1. - m_)[:, None] * h1
 
-        return h, ctx_, alpha.T
+        return h2, ctx_, alpha.T  # pstate_, preact, preactx, r, u
 
-    seqs = [mask, state_below_, state_belowx, state_belowc]
+    seqs = [mask, state_below_, state_belowx]
+    #seqs = [mask, state_below_, state_belowx, state_belowc]
     _step = _step_slice
 
     shared_vars = [tparams[_p(prefix, 'U')],
                    tparams[_p(prefix, 'Wc')],
-                   tparams[_p(prefix, 'Wd_att')],
+                   tparams[_p(prefix, 'W_comb_att')],
                    tparams[_p(prefix, 'U_att')],
                    tparams[_p(prefix, 'c_tt')],
                    tparams[_p(prefix, 'Ux')],
-                   tparams[_p(prefix, 'Wcx')]]
+                   tparams[_p(prefix, 'Wcx')],
+                   tparams[_p(prefix, 'U_nl')],
+                   tparams[_p(prefix, 'Ux_nl')],
+                   tparams[_p(prefix, 'b_nl')],
+                   tparams[_p(prefix, 'bx_nl')]]
 
     if one_step:
-        rval = _step(*(
-            seqs+[init_state, None, None, pctx_, context]+shared_vars))
+        rval = _step(*(seqs + [init_state, None, None, pctx_, context] +
+                       shared_vars))
     else:
-        rval, updates = theano.scan(
-            _step,
-            sequences=seqs,
-            outputs_info=[init_state,
-                          tensor.alloc(0., n_samples, context.shape[2]),
-                          tensor.alloc(0., n_samples, context.shape[0])],
-            non_sequences=[pctx_,
-                           context]+shared_vars,
-            name=_p(prefix, '_layers'),
-            n_steps=nsteps,
-            profile=profile,
-            strict=True)
+        rval, updates = theano.scan(_step,
+                                    sequences=seqs,
+                                    outputs_info=[init_state,
+                                                  tensor.alloc(0., n_samples,
+                                                               context.shape[2]),
+                                                  tensor.alloc(0., n_samples,
+                                                               context.shape[0])],
+                                    non_sequences=[pctx_, context]+shared_vars,
+                                    name=_p(prefix, '_layers'),
+                                    n_steps=nsteps,
+                                    profile=profile,
+                                    strict=True)
     return rval
 
 
@@ -615,6 +642,8 @@ def build_model(tparams, options):
     logit_ctx = get_layer('ff')[1](tparams, ctxs, options,
                                    prefix='ff_logit_ctx', activ='linear')
     logit = tensor.tanh(logit_lstm+logit_prev+logit_ctx)
+    if options['use_dropout']:
+        logit = dropout_layer(logit, use_noise, trng)
     logit = get_layer('ff')[1](tparams, logit, options,
                                prefix='ff_logit', activ='linear')
     logit_shp = logit.shape
@@ -685,6 +714,9 @@ def build_sampler(tparams, options, trng):
     # get the weighted averages of context for this target word y
     ctxs = proj[1]
 
+    # get alignments (weights) to be returned by f_next function
+    alignments = proj[2]
+
     logit_lstm = get_layer('ff')[1](tparams, next_state, options,
                                     prefix='ff_logit_lstm', activ='linear')
     logit_prev = get_layer('ff')[1](tparams, emb, options,
@@ -705,7 +737,7 @@ def build_sampler(tparams, options, trng):
     # sampled word for the next target, next hidden state to be used
     print 'Building f_next..',
     inps = [y, ctx, init_state]
-    outs = [next_probs, next_sample, next_state]
+    outs = [next_probs, next_sample, next_state, alignments]
     f_next = theano.function(inps, outs, name='f_next', profile=profile)
     print 'Done'
 
@@ -715,7 +747,7 @@ def build_sampler(tparams, options, trng):
 # generate sample, either with stochastic sampling or beam search. Note that,
 # this function iteratively calls f_init and f_next functions.
 def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
-               stochastic=True, argmax=False):
+               stochastic=True, argmax=False, alignments=False):
 
     # k is the beam size we have
     if k > 1:
@@ -744,6 +776,9 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
         inps = [next_w, ctx, next_state]
         ret = f_next(*inps)
         next_p, next_w, next_state = ret[0], ret[1], ret[2]
+
+        if alignments:
+            alignment_weigths = ret[-1]
 
         if stochastic:
             if argmax:
@@ -877,7 +912,7 @@ def adam(lr, tparams, grads, inp, cost):
     return f_grad_shared, f_update
 
 
-def adadelta(lr, tparams, grads, inp, cost):
+def adadelta(lr, tparams, grads, inp, cost, opt_ret=None):
     zipped_grads = [theano.shared(p.get_value() * numpy.float32(0.),
                                   name='%s_grad' % k)
                     for k, p in tparams.iteritems()]
@@ -892,7 +927,13 @@ def adadelta(lr, tparams, grads, inp, cost):
     rg2up = [(rg2, 0.95 * rg2 + 0.05 * (g ** 2))
              for rg2, g in zip(running_grads2, grads)]
 
-    f_grad_shared = theano.function(inp, cost, updates=zgup+rg2up,
+    outs = [cost]
+
+    # we expect a dictionary here for opt_ret
+    if opt_ret is not None:
+        outs += opt_ret.values()
+
+    f_grad_shared = theano.function(inp, outs, updates=zgup+rg2up,
                                     profile=profile)
 
     updir = [-tensor.sqrt(ru2 + 1e-6) / tensor.sqrt(rg2 + 1e-6) * zg
@@ -976,8 +1017,8 @@ def train(dim_word=100,  # word vector dimensionality
           valid_batch_size=16,
           saveto='model.npz',
           validFreq=1000,
-          saveFreq=1000,  # save the parameters after every saveFreq updates
-          sampleFreq=100,  # generate some samples after every sampleFreq
+          saveFreq=1000,   # save the parameters after every saveFreq updates
+          sampleFreq=100,   # generate some samples after every sampleFreq
           datasets=[
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.en.tok',
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.fr.tok'],
@@ -987,7 +1028,8 @@ def train(dim_word=100,  # word vector dimensionality
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.en.tok.pkl',
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.fr.tok.pkl'],
           use_dropout=False,
-          reload_=False):
+          reload_=False,
+          disp_alignments=False):
 
     # Model options
     model_options = locals().copy()
@@ -1085,7 +1127,8 @@ def train(dim_word=100,  # word vector dimensionality
     # compile the optimizer, the actual computational graph is compiled here
     lr = tensor.scalar(name='lr')
     print 'Building optimizers...',
-    f_grad_shared, f_update = eval(optimizer)(lr, tparams, grads, inps, cost)
+    f_grad_shared, f_update = eval(optimizer)(lr, tparams, grads, inps, cost,
+                                              opt_ret)
     print 'Done'
 
     print 'Optimization'
@@ -1095,7 +1138,7 @@ def train(dim_word=100,  # word vector dimensionality
     if reload_ and os.path.exists(saveto):
         history_errs = list(numpy.load(saveto)['history_errs'])
     best_p = None
-    bad_count = 0
+    bad_counter = 0
 
     if validFreq == -1:
         validFreq = len(train[0])/batch_size
@@ -1114,7 +1157,7 @@ def train(dim_word=100,  # word vector dimensionality
             uidx += 1
             use_noise.set_value(1.)
 
-            x, x_mask, y, y_mask = prepare_data(x, y, maxlen=maxlen,
+            x, x_mask, y, y_mask = prepare_data(x, y, maxlen=None,
                                                 n_words_src=n_words_src,
                                                 n_words=n_words)
 
@@ -1126,7 +1169,8 @@ def train(dim_word=100,  # word vector dimensionality
             ud_start = time.time()
 
             # compute cost, grads and copy grads to shared variables
-            cost = f_grad_shared(x, x_mask, y, y_mask)
+            ret_vals = f_grad_shared(x, x_mask, y, y_mask)
+            cost = ret_vals[0]
 
             # do the update on parameters
             f_update(lrate)
@@ -1141,7 +1185,10 @@ def train(dim_word=100,  # word vector dimensionality
 
             # verbose
             if numpy.mod(uidx, dispFreq) == 0:
-                print 'Epoch ', eidx, 'Update ', uidx, 'Cost ', cost, 'UD ', ud
+                print 'Epoch ', eidx, 'Update ', uidx, \
+                    'Cost ', cost, 'UD ', ud, \
+                    'Max-alpha {}'.format(ret_vals[-1].max()) \
+                    if disp_alignments else ''
 
             # save the best model so far
             if numpy.mod(uidx, saveFreq) == 0:
@@ -1165,7 +1212,8 @@ def train(dim_word=100,  # word vector dimensionality
                                                model_options, trng=trng, k=1,
                                                maxlen=30,
                                                stochastic=stochastic,
-                                               argmax=False)
+                                               argmax=False,
+                                               alignments=disp_alignments)
                     print 'Source ', jj, ': ',
                     for vv in x[:, jj]:
                         if vv == 0:
