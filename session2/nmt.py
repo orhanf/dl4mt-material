@@ -644,7 +644,7 @@ def build_model(tparams, options):
     logit = tensor.tanh(logit_lstm+logit_prev+logit_ctx)
     if options['use_dropout']:
         logit = dropout_layer(logit, use_noise, trng)
-    logit = get_layer('ff')[1](tparams, logit, options, 
+    logit = get_layer('ff')[1](tparams, logit, options,
                                prefix='ff_logit', activ='linear')
     logit_shp = logit.shape
     probs = tensor.nnet.softmax(logit.reshape([logit_shp[0]*logit_shp[1],
@@ -997,6 +997,62 @@ def sgd(lr, tparams, grads, x, mask, y, cost):
     return f_grad_shared, f_update
 
 
+class NoiseGenerator(object):
+    """Object to handle noise generation for weights and gradients."""
+    def __init__(self, tparams):
+        self.tparams = tparams
+
+    def _apply_only(self, filter_params):
+        tparams = []
+        if filter_params == "ff":
+            tparams += [v for p, v in self.tparams.items()
+                        if p.startswith('ff_')
+                        or p.startswith('Wemb')]
+        elif filter_params == "rec":
+            raise NotImplementedError
+        elif filter_params == "all":
+            tparams = self.tparams.values()
+        else:
+            raise ValueError("Filter must be ff, rec or all")
+        return tparams
+
+    def get_func(self, noise_type, noise_shape, noise_amount, filter_params,
+                 trng=None):
+
+        # Check validity of arguments
+        if noise_type not in ['add', 'del']:
+            raise ValueError('Noise type must be either (add)itive'
+                             ' or (del)etion')
+        if noise_shape not in ['normal']:
+            raise ValueError('Noise shape must be (normal)')
+        if not isinstance(noise_amount, float):
+            raise ValueError('Noise amount must be a float scalar')
+        if trng is None:
+            trng = RandomStreams(1234)
+
+        # Filter the parameters/gradients to be perturbed
+        tparams = self._apply_only(filter_params)
+
+        # Compile necessary functions
+        if noise_type == 'add':
+            noise_func = theano.function(
+                inputs=[], outputs=[], name='add_noise',
+                updates=[
+                    (p, p + trng.normal(
+                        p.get_value().shape, avg=0, std=noise_amount,
+                        dtype=p.dtype))
+                    for p in tparams])
+        else:
+            noise_func = theano.function(
+                inputs=[], outputs=[], name='add_noise',
+                updates=[
+                    (p, p * trng.binomial(
+                        p.get_value().shape, n=1, p=1.-noise_amount,
+                        dtype=p.dtype))
+                    for p in tparams])
+        return noise_func
+
+
 def train(dim_word=100,  # word vector dimensionality
           dim=1000,  # the number of LSTM units
           encoder='gru',
@@ -1029,7 +1085,11 @@ def train(dim_word=100,  # word vector dimensionality
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.fr.tok.pkl'],
           use_dropout=False,
           reload_=False,
-          disp_alignments=False):
+          disp_alignments=False,
+          add_wnoise_ff=False,
+          wnoise_type_ff='add',
+          wnoise_shape_ff='normal',
+          wnoise_amount_ff=0.01):
 
     # Model options
     model_options = locals().copy()
@@ -1124,6 +1184,14 @@ def train(dim_word=100,  # word vector dimensionality
                                            g))
         grads = new_grads
 
+    # add noise to feed forward weights
+    if add_wnoise_ff:
+        f_wnoise_ff = NoiseGenerator(tparams).get_func(
+            noise_type=wnoise_type_ff,
+            noise_shape=wnoise_shape_ff,
+            noise_amount=wnoise_amount_ff,
+            filter_params='ff')
+
     # compile the optimizer, the actual computational graph is compiled here
     lr = tensor.scalar(name='lr')
     print 'Building optimizers...',
@@ -1167,6 +1235,15 @@ def train(dim_word=100,  # word vector dimensionality
                 continue
 
             ud_start = time.time()
+
+            # apply weight noise here
+            print "-" * 80
+            print tparams['Wemb'].get_value()
+            print tparams['Wemb'].get_value().sum()
+            if add_wnoise_ff:
+                f_wnoise_ff()
+            print tparams['Wemb'].get_value()
+            print tparams['Wemb'].get_value().sum()
 
             # compute cost, grads and copy grads to shared variables
             ret_vals = f_grad_shared(x, x_mask, y, y_mask)
