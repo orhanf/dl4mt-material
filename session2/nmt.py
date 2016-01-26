@@ -456,8 +456,7 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         pctx__ = tensor.tanh(pctx__)
         alpha = tensor.dot(pctx__, U_att)+c_tt
         alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]])
-        alpha = tensor.exp(alpha - alpha.max(0, keepdims=True))
-
+        alpha = tensor.exp(alpha)
         if context_mask:
             alpha = alpha * context_mask
         alpha = alpha / alpha.sum(0, keepdims=True)
@@ -714,9 +713,6 @@ def build_sampler(tparams, options, trng):
     # get the weighted averages of context for this target word y
     ctxs = proj[1]
 
-    # get alignments (weights) to be returned by f_next function
-    alignments = proj[2]
-
     logit_lstm = get_layer('ff')[1](tparams, next_state, options,
                                     prefix='ff_logit_lstm', activ='linear')
     logit_prev = get_layer('ff')[1](tparams, emb, options,
@@ -737,7 +733,7 @@ def build_sampler(tparams, options, trng):
     # sampled word for the next target, next hidden state to be used
     print 'Building f_next..',
     inps = [y, ctx, init_state]
-    outs = [next_probs, next_sample, next_state, alignments]
+    outs = [next_probs, next_sample, next_state]
     f_next = theano.function(inps, outs, name='f_next', profile=profile)
     print 'Done'
 
@@ -747,7 +743,7 @@ def build_sampler(tparams, options, trng):
 # generate sample, either with stochastic sampling or beam search. Note that,
 # this function iteratively calls f_init and f_next functions.
 def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
-               stochastic=True, argmax=False, alignments=False):
+               stochastic=True, argmax=False):
 
     # k is the beam size we have
     if k > 1:
@@ -776,9 +772,6 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
         inps = [next_w, ctx, next_state]
         ret = f_next(*inps)
         next_p, next_w, next_state = ret[0], ret[1], ret[2]
-
-        if alignments:
-            alignment_weigths = ret[-1]
 
         if stochastic:
             if argmax:
@@ -912,7 +905,7 @@ def adam(lr, tparams, grads, inp, cost):
     return f_grad_shared, f_update
 
 
-def adadelta(lr, tparams, grads, inp, cost, opt_ret=None):
+def adadelta(lr, tparams, grads, inp, cost):
     zipped_grads = [theano.shared(p.get_value() * numpy.float32(0.),
                                   name='%s_grad' % k)
                     for k, p in tparams.iteritems()]
@@ -927,13 +920,7 @@ def adadelta(lr, tparams, grads, inp, cost, opt_ret=None):
     rg2up = [(rg2, 0.95 * rg2 + 0.05 * (g ** 2))
              for rg2, g in zip(running_grads2, grads)]
 
-    outs = [cost]
-
-    # we expect a dictionary here for opt_ret
-    if opt_ret is not None:
-        outs += opt_ret.values()
-
-    f_grad_shared = theano.function(inp, outs, updates=zgup+rg2up,
+    f_grad_shared = theano.function(inp, cost, updates=zgup+rg2up,
                                     profile=profile)
 
     updir = [-tensor.sqrt(ru2 + 1e-6) / tensor.sqrt(rg2 + 1e-6) * zg
@@ -997,62 +984,6 @@ def sgd(lr, tparams, grads, x, mask, y, cost):
     return f_grad_shared, f_update
 
 
-class NoiseGenerator(object):
-    """Object to handle noise generation for weights and gradients."""
-    def __init__(self, tparams):
-        self.tparams = tparams
-
-    def _apply_only(self, filter_params):
-        tparams = []
-        if filter_params == "ff":
-            tparams += [v for p, v in self.tparams.items()
-                        if p.startswith('ff_')
-                        or p.startswith('Wemb')]
-        elif filter_params == "rec":
-            raise NotImplementedError
-        elif filter_params == "all":
-            tparams = self.tparams.values()
-        else:
-            raise ValueError("Filter must be ff, rec or all")
-        return tparams
-
-    def get_func(self, noise_type, noise_shape, noise_amount, filter_params,
-                 trng=None):
-
-        # Check validity of arguments
-        if noise_type not in ['add', 'del']:
-            raise ValueError('Noise type must be either (add)itive'
-                             ' or (del)etion')
-        if noise_shape not in ['normal']:
-            raise ValueError('Noise shape must be (normal)')
-        if not isinstance(noise_amount, float):
-            raise ValueError('Noise amount must be a float scalar')
-        if trng is None:
-            trng = RandomStreams(1234)
-
-        # Filter the parameters/gradients to be perturbed
-        tparams = self._apply_only(filter_params)
-
-        # Compile necessary functions
-        if noise_type == 'add':
-            noise_func = theano.function(
-                inputs=[], outputs=[], name='add_noise',
-                updates=[
-                    (p, p + trng.normal(
-                        p.get_value().shape, avg=0, std=noise_amount,
-                        dtype=p.dtype))
-                    for p in tparams])
-        else:
-            noise_func = theano.function(
-                inputs=[], outputs=[], name='add_noise',
-                updates=[
-                    (p, p * trng.binomial(
-                        p.get_value().shape, n=1, p=1.-noise_amount,
-                        dtype=p.dtype))
-                    for p in tparams])
-        return noise_func
-
-
 def train(dim_word=100,  # word vector dimensionality
           dim=1000,  # the number of LSTM units
           encoder='gru',
@@ -1085,11 +1016,7 @@ def train(dim_word=100,  # word vector dimensionality
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.fr.tok.pkl'],
           use_dropout=False,
           reload_=False,
-          disp_alignments=False,
-          add_wnoise_ff=False,
-          wnoise_type_ff='add',
-          wnoise_shape_ff='normal',
-          wnoise_amount_ff=0.01):
+          overwrite=False):
 
     # Model options
     model_options = locals().copy()
@@ -1106,6 +1033,7 @@ def train(dim_word=100,  # word vector dimensionality
 
     # reload options
     if reload_ and os.path.exists(saveto):
+        print 'Reloading model options'
         with open('%s.pkl' % saveto, 'rb') as f:
             models_options = pkl.load(f)
 
@@ -1125,6 +1053,7 @@ def train(dim_word=100,  # word vector dimensionality
     params = init_params(model_options)
     # reload parameters
     if reload_ and os.path.exists(saveto):
+        print 'Reloading model parameters'
         params = load_params(saveto, params)
 
     tparams = init_tparams(params)
@@ -1136,7 +1065,7 @@ def train(dim_word=100,  # word vector dimensionality
         build_model(tparams, model_options)
     inps = [x, x_mask, y, y_mask]
 
-    print 'Buliding sampler'
+    print 'Building sampler'
     f_init, f_next = build_sampler(tparams, model_options, trng)
 
     # before any regularizer
@@ -1184,29 +1113,25 @@ def train(dim_word=100,  # word vector dimensionality
                                            g))
         grads = new_grads
 
-    # add noise to feed forward weights
-    if add_wnoise_ff:
-        f_wnoise_ff = NoiseGenerator(tparams).get_func(
-            noise_type=wnoise_type_ff,
-            noise_shape=wnoise_shape_ff,
-            noise_amount=wnoise_amount_ff,
-            filter_params='ff')
-
     # compile the optimizer, the actual computational graph is compiled here
     lr = tensor.scalar(name='lr')
     print 'Building optimizers...',
-    f_grad_shared, f_update = eval(optimizer)(lr, tparams, grads, inps, cost,
-                                              opt_ret)
+    f_grad_shared, f_update = eval(optimizer)(lr, tparams, grads, inps, cost)
     print 'Done'
 
     print 'Optimization'
 
+    best_p = None
+    bad_counter = 0
+    uidx = 0
+    estop = False
     history_errs = []
     # reload history
     if reload_ and os.path.exists(saveto):
-        history_errs = list(numpy.load(saveto)['history_errs'])
-    best_p = None
-    bad_counter = 0
+        rmodel = numpy.load(saveto)
+        history_errs = list(rmodel['history_errs'])
+        if 'uidx' in rmodel:
+            uidx = rmodel['uidx']
 
     if validFreq == -1:
         validFreq = len(train[0])/batch_size
@@ -1215,8 +1140,6 @@ def train(dim_word=100,  # word vector dimensionality
     if sampleFreq == -1:
         sampleFreq = len(train[0])/batch_size
 
-    uidx = 0
-    estop = False
     for eidx in xrange(max_epochs):
         n_samples = 0
 
@@ -1225,7 +1148,7 @@ def train(dim_word=100,  # word vector dimensionality
             uidx += 1
             use_noise.set_value(1.)
 
-            x, x_mask, y, y_mask = prepare_data(x, y, maxlen=None,
+            x, x_mask, y, y_mask = prepare_data(x, y, maxlen=maxlen,
                                                 n_words_src=n_words_src,
                                                 n_words=n_words)
 
@@ -1236,18 +1159,8 @@ def train(dim_word=100,  # word vector dimensionality
 
             ud_start = time.time()
 
-            # apply weight noise here
-            print "-" * 80
-            print tparams['Wemb'].get_value()
-            print tparams['Wemb'].get_value().sum()
-            if add_wnoise_ff:
-                f_wnoise_ff()
-            print tparams['Wemb'].get_value()
-            print tparams['Wemb'].get_value().sum()
-
             # compute cost, grads and copy grads to shared variables
-            ret_vals = f_grad_shared(x, x_mask, y, y_mask)
-            cost = ret_vals[0]
+            cost = f_grad_shared(x, x_mask, y, y_mask)
 
             # do the update on parameters
             f_update(lrate)
@@ -1262,22 +1175,29 @@ def train(dim_word=100,  # word vector dimensionality
 
             # verbose
             if numpy.mod(uidx, dispFreq) == 0:
-                print 'Epoch ', eidx, 'Update ', uidx, \
-                    'Cost ', cost, 'UD ', ud, \
-                    'Max-alpha {}'.format(ret_vals[-1].max()) \
-                    if disp_alignments else ''
+                print 'Epoch ', eidx, 'Update ', uidx, 'Cost ', cost, 'UD ', ud
 
-            # save the best model so far
+            # save the best model so far, in addition, save the latest model
+            # into a separate file with the iteration number for external eval
             if numpy.mod(uidx, saveFreq) == 0:
-                print 'Saving...',
-
+                print 'Saving the best model...',
                 if best_p is not None:
                     params = best_p
                 else:
                     params = unzip(tparams)
-                numpy.savez(saveto, history_errs=history_errs, **params)
+                numpy.savez(saveto, history_errs=history_errs, uidx=uidx, **params)
                 pkl.dump(model_options, open('%s.pkl' % saveto, 'wb'))
                 print 'Done'
+
+                # save with uidx
+                if not overwrite:
+                    print 'Saving the model at iteration {}...'.format(uidx),
+                    saveto_uidx = '{}.iter{}.npz'.format(
+                        os.path.splitext(saveto)[0], uidx)
+                    numpy.savez(saveto_uidx, history_errs=history_errs,
+                                uidx=uidx, **unzip(tparams))
+                    print 'Done'
+
 
             # generate some samples with the model and display them
             if numpy.mod(uidx, sampleFreq) == 0:
@@ -1289,8 +1209,7 @@ def train(dim_word=100,  # word vector dimensionality
                                                model_options, trng=trng, k=1,
                                                maxlen=30,
                                                stochastic=stochastic,
-                                               argmax=False,
-                                               alignments=disp_alignments)
+                                               argmax=False)
                     print 'Source ', jj, ': ',
                     for vv in x[:, jj]:
                         if vv == 0:
@@ -1371,6 +1290,7 @@ def train(dim_word=100,  # word vector dimensionality
     params = copy.copy(best_p)
     numpy.savez(saveto, zipped_params=best_p,
                 history_errs=history_errs,
+                uidx=uidx,
                 **params)
 
     return valid_err
